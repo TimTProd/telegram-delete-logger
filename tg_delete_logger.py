@@ -44,25 +44,82 @@ from telethon.tl.types import (
 import config
 import file_encrypt
 
+# --- paths & sqlite datetime adapters ---
+try:
+    from pathlib import Path
+    from datetime import datetime, date
+    import sqlite3 as _sqlite3  # alias to avoid shadowing if 'sqlite3' imported above
+
+    _BASE_DIR = Path(__file__).resolve().parent
+    _DB_DIR = _BASE_DIR / "db"
+    _MEDIA_DIR = _BASE_DIR / "media"
+    _DB_DIR.mkdir(parents=True, exist_ok=True)
+    _MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    _SESSION_PATH = str(_DB_DIR / "user")
+
+    # Python 3.12+ removes default datetime adapter; register explicit adapters.
+    _sqlite3.register_adapter(datetime, lambda d: d.strftime('%Y-%m-%d %H:%M:%S'))
+    _sqlite3.register_adapter(date, lambda d: d.strftime('%Y-%m-%d'))
+except Exception as _e:
+    # Fallbacks in case of very early import-time failures
+    _SESSION_PATH = "db/user"
+# ----------------------------------------
+
+
 TYPE_USER = 1
 TYPE_CHANNEL = 2
 TYPE_GROUP = 3
 TYPE_BOT = 4
 TYPE_UNKNOWN = 0
 
-client = TelegramClient('db/user', config.API_ID, config.API_HASH)
+client = TelegramClient(_SESSION_PATH, config.API_ID, config.API_HASH)
 my_id = -1
 sqlite_cursor: sqlite3.Cursor = None
 sqlite_connection: sqlite3.Connection = None
 
+# Resolve the target chat for logging robustly (supports LOG_CHAT, LOG_CHAT_ID, or defaults to 'me')
+LOG_ENTITY = None
+async def _resolve_log_entity():
+    global LOG_ENTITY
+    candidates = []
+    if hasattr(config, "LOG_CHAT") and getattr(config, "LOG_CHAT"):
+        candidates.append(getattr(config, "LOG_CHAT"))
+    if hasattr(config, "LOG_CHAT_ID") and getattr(config, "LOG_CHAT_ID"):
+        candidates.append(getattr(config, "LOG_CHAT_ID"))
+    candidates.append("me")
+    last_exc = None
+    for cand in candidates:
+        try:
+            ent = await client.get_entity(cand)
+            return ent
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Could not resolve a log chat/entity")
+
+async def send_log(text=None, **kwargs):
+    """Send a log message; auto-resolve entity and retry on cache misses."""
+    global LOG_ENTITY
+    if LOG_ENTITY is None:
+        LOG_ENTITY = await _resolve_log_entity()
+    try:
+        return await client.send_message(LOG_ENTITY, text, **kwargs)
+    except ValueError:
+        # Cache miss / hash mismatch: resolve again and retry
+        LOG_ENTITY = await _resolve_log_entity()
+        return await client.send_message(LOG_ENTITY, text, **kwargs)
+
+
 
 def init_db():
-    if not os.path.exists('db'):
-        os.mkdir('db')
-    if not os.path.exists('media'):
-        os.mkdir('media')
+    if not _DB_DIR.exists():
+        _DB_DIR.mkdir(parents=True, exist_ok=True)
+    if not _MEDIA_DIR.exists():
+        _MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-    connection = sqlite3.connect("db/messages.db")
+    connection = sqlite3.connect(str(_DB_DIR / "messages.db"), detect_types=0, check_same_thread=False)
     cursor = connection.cursor()
     cursor.execute("""CREATE TABLE IF NOT EXISTS messages
                  (id INTEGER, from_id INTEGER, chat_id INTEGER,
@@ -314,12 +371,12 @@ async def edited_deleted_handler(event: Union[MessageDeleted.Event, MessageEdite
         with retrieve_media_as_file(message['id'], message['chat_id'], message['media'], message['noforwards'] or message['self_destructing']) as media_file:
 
             if is_sticker or is_round_video or is_dice or is_game or is_contact or is_geo or is_poll:
-                sent_msg = await client.send_message(config.LOG_CHAT_ID, file=media_file)
+                sent_msg = await send_log( file=media_file)
                 await sent_msg.reply(text)
             elif is_instant_view:
-                await client.send_message(config.LOG_CHAT_ID, text)
+                await send_log( text)
             else:
-                await client.send_message(config.LOG_CHAT_ID, text, file=media_file)
+                await send_log( text, file=media_file)
 
         if is_gif and config.DELETE_SENT_GIFS_FROM_SAVED:
             await delete_from_saved_gifs(message['media'].document)
@@ -338,7 +395,7 @@ async def edited_deleted_handler(event: Union[MessageDeleted.Event, MessageEdite
         event_verb = "edited"
 
     if len(ids) > config.RATE_LIMIT_NUM_MESSAGES and log_deleted_sender_ids:
-        await client.send_message(config.LOG_CHAT_ID, f"{len(ids)} messages {event_verb}. Logged {config.RATE_LIMIT_NUM_MESSAGES}.")
+        await send_log( f"{len(ids)} messages {event_verb}. Logged {config.RATE_LIMIT_NUM_MESSAGES}.")
 
     logging.info(
         f"Got 1 {event_verb} message. DB has {len(messages)}. Users: {', '.join(str(_id) for _id in log_deleted_sender_ids)}"
@@ -379,7 +436,7 @@ async def save_restricted_msg(link: str):
             chat_id = int(parts[0])
             msg_id = int(parts[1])
         else:
-            await client.send_message(config.LOG_CHAT_ID, f"Could not parse link: {link}")
+            await send_log( f"Could not parse link: {link}")
             return
     else:
         parts = link.split('/')
@@ -404,11 +461,11 @@ async def save_restricted_msg(link: str):
         if msg.media:
             await save_media_as_file(msg)
             with retrieve_media_as_file(msg_id, chat_id, msg.media, True) as f:
-                await client.send_message('me', text, file=f)
+                await send_log( text, file=f)
         else:
-            await client.send_message('me', text)
+            await send_log( text)
     except Exception as e:
-        await client.send_message(config.LOG_CHAT_ID, str(e))
+        await send_log( str(e))
 
 
 async def save_media_as_file(msg: Message):
@@ -418,7 +475,7 @@ async def save_media_as_file(msg: Message):
     if msg.media:
         if msg.file and msg.file.size > config.MAX_IN_MEMORY_FILE_SIZE:
             raise Exception(f"File too large to save ({msg.file.size} bytes)")
-        file_path = f"media/{msg_id}_{chat_id}"
+        file_path = str(_MEDIA_DIR / f"{msg_id}_{chat_id}")
 
         with file_encrypt.encrypted(file_path) as f:
             await client.download_media(msg.media, f)
@@ -427,7 +484,7 @@ async def save_media_as_file(msg: Message):
 @contextmanager
 def retrieve_media_as_file(msg_id: int, chat_id: int, media, noforwards: bool):
     file_name = get_file_name(media)
-    file_path = f"media/{msg_id}_{chat_id}"
+    file_path = str(_MEDIA_DIR / f"{msg_id}_{chat_id}")
 
     if noforwards and\
             not isinstance(media, MessageMediaGeo) and\
