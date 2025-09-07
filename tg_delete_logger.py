@@ -4,7 +4,7 @@ import logging
 import pickle
 import sqlite3
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Union
 import os
 import re
@@ -113,6 +113,40 @@ async def send_log(text=None, **kwargs):
 
 
 
+# --- timezone helpers ---
+def _get_local_zoneinfo():
+    tz_name = getattr(config, "TIMEZONE", "UTC")
+    try:
+        from zoneinfo import ZoneInfo  # Python 3.9+
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
+
+def _to_local_timestr(value: "datetime|str") -> str:
+    """Convert a UTC datetime (or 'YYYY-MM-DD HH:MM:SS' string assumed UTC)
+    to configured timezone string 'YYYY-MM-DD HH:MM:SS'."""
+    target_tz = _get_local_zoneinfo()
+    dt: datetime
+    if isinstance(value, str):
+        try:
+            dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            # best-effort parse
+            try:
+                dt = datetime.fromisoformat(value)
+            except Exception:
+                return value
+        dt = dt.replace(tzinfo=timezone.utc)
+    elif isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    else:
+        return str(value)
+
+    local_dt = dt.astimezone(target_tz)
+    return local_dt.strftime('%Y-%m-%d %H:%M:%S')
+
+
 def init_db():
     if not _DB_DIR.exists():
         _DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -209,7 +243,7 @@ async def new_message_handler(event: Union[NewMessage.Event, MessageEdited.Event
                 sqlite3.Binary(pickle.dumps(event.message.media)),
                 int(noforwards),
                 int(self_destructing),
-                datetime.now())
+                datetime.now(timezone.utc))
         )
         sqlite_connection.commit()
 
@@ -265,6 +299,7 @@ def load_messages_from_event(event: Union[MessageDeleted.Event, MessageEdited.Ev
             "media": pickle.loads(db_result[4]),
             "noforwards": db_result[5],
             "self_destructing": db_result[6],
+            "created_time": db_result[7],
         })
 
     return messages
@@ -336,12 +371,26 @@ async def edited_deleted_handler(event: Union[MessageDeleted.Event, MessageEdite
 
             text += f"in {mention_chat}\n"
 
+            if 'created_time' in message and message['created_time']:
+                created_time_value = message['created_time']
+                created_time_str = _to_local_timestr(created_time_value)
+                text += f"**send time:** {created_time_str}\n"
+
             if message['msg_text']:
                 text += "**Message:** \n" + message['msg_text']
         elif isinstance(event, MessageEdited.Event):
             text = f"**✏Edited message from: **{mention_sender}\n"
 
             text += f"in {mention_chat}\n"
+
+            if 'created_time' in message and message['created_time']:
+                created_time_value = message['created_time']
+                created_time_str = _to_local_timestr(created_time_value)
+                text += f"**send time:** {created_time_str}\n"
+
+            if getattr(event.message, 'edit_date', None):
+                edit_time_str = _to_local_timestr(event.message.edit_date)
+                text += f"**edit time:** {edit_time_str}\n"
 
             if message['msg_text']:
                 text += f"**Original message:**\n{message['msg_text']}\n\n"
@@ -453,6 +502,13 @@ async def save_restricted_msg(link: str):
     text = f"**↗️Saved message from: **{mention_sender}\n"
 
     text += f"in {mention_chat}\n"
+
+    # include original message date/time
+    try:
+        if getattr(msg, 'date', None):
+            text += f"**send time:** {_to_local_timestr(msg.date)}\n"
+    except Exception:
+        pass
 
     if msg.text:
         text += "**Message:** \n" + msg.text

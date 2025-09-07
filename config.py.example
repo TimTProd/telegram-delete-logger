@@ -24,3 +24,6 @@ LOG_CHAT_ID = -10000
 IGNORED_IDS = {
     -10000
 }
+
+# IANA timezone name used to display timestamps (e.g. 'Europe/Moscow', 'UTC')
+TIMEZONE = 'UTC'
